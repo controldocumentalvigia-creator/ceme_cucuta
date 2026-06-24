@@ -10,7 +10,6 @@ from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
 st.set_page_config(
@@ -284,9 +283,9 @@ left, right = st.columns([1, 2])
 with left:
     st.dataframe(faltantes, use_container_width=True, hide_index=True)
 with right:
-    fig = px.bar(faltantes, x="Campo crítico", y="Registros con novedad", text="Registros con novedad", title="Campos pendientes para legalización")
-    fig.update_layout(height=360, yaxis_title="Registros", xaxis_title="")
-    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Campos pendientes para legalización")
+    chart_data = faltantes.set_index("Campo crítico")["Registros con novedad"]
+    st.bar_chart(chart_data, height=360)
 
 # -----------------------------
 # VISUALES OPERATIVOS
@@ -298,9 +297,9 @@ with tab1:
     diario = agg_count_value(f, ["FECHA", "TIPO_SERVICIO"])
     if not diario.empty:
         diario["FECHA_TXT"] = diario["FECHA"].dt.strftime("%d/%m/%Y")
-        fig = px.bar(diario, x="FECHA_TXT", y="SERVICIOS", color="TIPO_SERVICIO", title="Servicios por día")
-        fig.update_layout(height=420, xaxis_title="Fecha", yaxis_title="Servicios")
-        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Servicios por día")
+        chart_diario = diario.pivot_table(index="FECHA_TXT", columns="TIPO_SERVICIO", values="SERVICIOS", aggfunc="sum", fill_value=0)
+        st.bar_chart(chart_diario, height=420)
         diario_valor = f.groupby("FECHA", dropna=False).agg(SERVICIOS=("TIPO_SERVICIO", "size"), VALOR=("VALOR_SERVICIO", "sum"), REMESAS=("REMESA_TXT", "nunique")).reset_index()
         diario_valor["FECHA"] = diario_valor["FECHA"].dt.strftime("%d/%m/%Y")
         diario_valor["VALOR"] = diario_valor["VALOR"].map(money)
@@ -311,13 +310,11 @@ with tab2:
     rutas = agg_count_value(f, ["RUTA"])
     jornadas_df = agg_count_value(f, ["JORNADA"])
     with col_a:
-        fig = px.bar(rutas.head(15), x="SERVICIOS", y="RUTA", orientation="h", text="SERVICIOS", title="Top rutas por cantidad de servicios")
-        fig.update_layout(height=420, yaxis_title="", xaxis_title="Servicios")
-        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Top rutas por cantidad de servicios")
+        st.bar_chart(rutas.head(15).set_index("RUTA")["SERVICIOS"], height=420)
     with col_b:
-        fig = px.pie(jornadas_df, names="JORNADA", values="SERVICIOS", title="Participación por jornada")
-        fig.update_layout(height=420)
-        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Participación por jornada")
+        st.bar_chart(jornadas_df.set_index("JORNADA")["SERVICIOS"], height=420)
     rutas_show = rutas.copy()
     rutas_show["VALOR"] = rutas_show["VALOR"].map(money)
     st.dataframe(rutas_show, use_container_width=True, hide_index=True)
@@ -327,13 +324,11 @@ with tab3:
     conductores = agg_count_value(f[f["CONDUCTOR_TXT"].ne("")], ["CONDUCTOR"])
     placas = agg_count_value(f[f["PLACA_TXT"].ne("")], ["PLACA"])
     with col_a:
-        fig = px.bar(conductores.head(12), x="SERVICIOS", y="CONDUCTOR", orientation="h", text="SERVICIOS", title="Servicios por conductor")
-        fig.update_layout(height=450, yaxis_title="", xaxis_title="Servicios")
-        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Servicios por conductor")
+        st.bar_chart(conductores.head(12).set_index("CONDUCTOR")["SERVICIOS"], height=450)
     with col_b:
-        fig = px.bar(placas.head(12), x="SERVICIOS", y="PLACA", orientation="h", text="SERVICIOS", title="Servicios por placa")
-        fig.update_layout(height=450, yaxis_title="", xaxis_title="Servicios")
-        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Servicios por placa")
+        st.bar_chart(placas.head(12).set_index("PLACA")["SERVICIOS"], height=450)
 
 with tab4:
     adi_f = f[f["TIPO_SERVICIO"] == "ADICIONAL / URBANO"].copy()
@@ -345,14 +340,12 @@ with tab4:
         solicitantes_show["VALOR"] = solicitantes_show["VALOR"].map(money)
         col_a, col_b = st.columns(2)
         with col_a:
-            fig = px.bar(solicitantes, x="SERVICIOS", y="QUIEN SOLICITA", orientation="h", text="SERVICIOS", title="Adicionales por solicitante")
-            fig.update_layout(height=420, yaxis_title="", xaxis_title="Servicios")
-            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Adicionales por solicitante")
+            st.bar_chart(solicitantes.set_index("QUIEN SOLICITA")["SERVICIOS"], height=420)
         with col_b:
             obs = agg_count_value(adi_f, ["OBSERVACIONES"])
-            fig = px.bar(obs.head(10), x="SERVICIOS", y="OBSERVACIONES", orientation="h", text="SERVICIOS", title="Adicionales por observación/tipo")
-            fig.update_layout(height=420, yaxis_title="", xaxis_title="Servicios")
-            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Adicionales por observación/tipo")
+            st.bar_chart(obs.head(10).set_index("OBSERVACIONES")["SERVICIOS"], height=420)
         st.dataframe(solicitantes_show, use_container_width=True, hide_index=True)
 
 # -----------------------------
