@@ -1,404 +1,408 @@
-# app_cemex_legalizaciones.py
-# Dashboard Streamlit - Informe de Legalizaciones CEMEX
-# Ejecutar: streamlit run app_cemex_legalizaciones.py
-
-from __future__ import annotations
-
+import os
 import re
+from io import BytesIO
 from pathlib import Path
-from typing import Dict, Tuple
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import matplotlib.pyplot as plt
 
-st.set_page_config(
-    page_title="CEMEX | Informe de Legalizaciones",
-    page_icon="📋",
-    layout="wide",
-)
+st.set_page_config(page_title="CEMEX | Legalizaciones Cúcuta", layout="wide")
 
-DEFAULT_FILE = Path("CONSOLIDADO CUCUTA JUNIO 2026_V23.xlsx")
+# =========================
+# ESTILO
+# =========================
+st.markdown("""
+<style>
+.main {background-color:#f7f8fa;}
+.block-container {padding-top:1.2rem; padding-bottom:2rem;}
+[data-testid="stMetricValue"] {font-size: 1.55rem; font-weight: 800;}
+[data-testid="stMetricLabel"] {font-size: 0.9rem; color:#404040;}
+.card {
+    background:white; border:1px solid #e6e8eb; border-radius:14px;
+    padding:15px; box-shadow:0 1px 4px rgba(0,0,0,.05); height:100%;
+}
+.small {font-size: 0.86rem; color:#555;}
+.kpi-title {font-size:0.82rem;color:#555;margin-bottom:4px;}
+.kpi-value {font-size:1.45rem;font-weight:800;color:#111;}
+.kpi-sub {font-size:0.78rem;color:#777;}
+.alerta {background:#fff4e5;border-left:5px solid #f59e0b;padding:10px;border-radius:8px;}
+.ok {background:#eaf7ee;border-left:5px solid #22c55e;padding:10px;border-radius:8px;}
+.bad {background:#fdecec;border-left:5px solid #ef4444;padding:10px;border-radius:8px;}
+</style>
+""", unsafe_allow_html=True)
 
-# -----------------------------
-# ESTILOS
-# -----------------------------
-st.markdown(
-    """
-    <style>
-    .main .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
-    .kpi-card {
-        border: 1px solid #e8e8e8; border-radius: 14px; padding: 16px 18px;
-        background: #ffffff; box-shadow: 0 1px 4px rgba(0,0,0,0.06); min-height: 112px;
-    }
-    .kpi-title {font-size: 0.82rem; color: #555; margin-bottom: 6px; font-weight: 600;}
-    .kpi-value {font-size: 1.65rem; color: #111; font-weight: 800; line-height: 1.15;}
-    .kpi-sub {font-size: 0.78rem; color: #666; margin-top: 6px;}
-    .alert-ok {color: #116b2e; font-weight: 700;}
-    .alert-warn {color: #b35c00; font-weight: 700;}
-    .alert-risk {color: #a60000; font-weight: 700;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# -----------------------------
-# FUNCIONES BASE
-# -----------------------------
-def clean_col(col: object) -> str:
-    col = str(col).strip().upper()
-    col = re.sub(r"\s+", " ", col)
-    return col
-
-
-def money(x: float) -> str:
+# =========================
+# UTILIDADES
+# =========================
+def money(x):
     try:
+        if pd.isna(x):
+            return "$ 0"
         return "$ {:,.0f}".format(float(x)).replace(",", ".")
     except Exception:
         return "$ 0"
 
-
-def pct(x: float) -> str:
-    if pd.isna(x) or np.isinf(x):
+def pct(x):
+    try:
+        if pd.isna(x):
+            return "0,00%"
+        return f"{float(x)*100:,.2f}%".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
         return "0,00%"
-    return f"{x:.2%}".replace(".", ",")
 
+def clean_col(c):
+    c = str(c).strip().upper()
+    c = re.sub(r"\s+", " ", c)
+    c = c.replace("Á","A").replace("É","E").replace("Í","I").replace("Ó","O").replace("Ú","U").replace("Ñ","N")
+    return c
 
-def kpi_card(title: str, value: str, subtitle: str = ""):
-    st.markdown(
-        f"""
-        <div class="kpi-card">
-            <div class="kpi-title">{title}</div>
-            <div class="kpi-value">{value}</div>
-            <div class="kpi-sub">{subtitle}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def normalize_text(s):
+    if pd.isna(s):
+        return ""
+    return re.sub(r"\s+", " ", str(s).strip().upper())
 
+def to_number(s):
+    if pd.isna(s):
+        return 0.0
+    if isinstance(s, (int, float, np.number)):
+        return float(s)
+    txt = str(s).strip()
+    txt = re.sub(r"[^0-9,.-]", "", txt)
+    if txt == "":
+        return 0.0
+    # Manejo Colombia: 1.234.567,89
+    if "," in txt and "." in txt:
+        txt = txt.replace(".", "").replace(",", ".")
+    elif "," in txt and "." not in txt:
+        txt = txt.replace(",", ".")
+    try:
+        return float(txt)
+    except Exception:
+        return 0.0
 
-def first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = {clean_col(c): c for c in df.columns}
-    for c in candidates:
-        if clean_col(c) in cols:
-            return cols[clean_col(c)]
-    return None
+def to_date(s):
+    if pd.isna(s):
+        return pd.NaT
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
 
+def find_header_row(raw, required_words):
+    """Busca fila encabezado por palabras clave."""
+    for i in range(min(len(raw), 20)):
+        vals = [clean_col(v) for v in list(raw.iloc[i].values)]
+        joined = " | ".join(vals)
+        hits = sum(1 for w in required_words if w in joined)
+        if hits >= max(2, len(required_words)//2):
+            return i
+    return 0
 
-def to_num(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(
-        s.astype(str).str.replace("$", "", regex=False).str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
-        errors="coerce",
-    )
+def read_sheet_flexible(file, sheet_name, required_words):
+    raw = pd.read_excel(file, sheet_name=sheet_name, header=None, engine="openpyxl")
+    header = find_header_row(raw, required_words)
+    df = pd.read_excel(file, sheet_name=sheet_name, header=header, engine="openpyxl")
+    df = df.dropna(how="all")
+    df.columns = [clean_col(c) for c in df.columns]
+    df = df.loc[:, ~pd.Series(df.columns).duplicated().values]
+    return df
 
+def standardize(df, tipo):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out.columns = [clean_col(c) for c in out.columns]
 
-def normalize_text(s: pd.Series) -> pd.Series:
-    return s.fillna("").astype(str).str.strip().str.upper().replace({"NAN": "", "NONE": "", "NULL": ""})
+    # Quitar filas de encabezado repetidas
+    if "FECHA" in out.columns:
+        out = out[out["FECHA"].astype(str).str.upper().str.strip() != "FECHA"]
 
+    mapping = {
+        "FECHA":"FECHA", "HORA":"HORA", "CC":"CC", "CONDUCTOR":"CONDUCTOR", "PLACA":"PLACA",
+        "ORIGEN":"ORIGEN", "DESTINO":"DESTINO", "RUTA":"RUTA", "CANTIDAD USUARIO":"USUARIOS",
+        "FUNCIONARIOS":"FUNCIONARIO", "FUNCIONARIO":"FUNCIONARIO", "TURNO":"TURNO", "INGRESO":"INGRESO",
+        "JORNADA":"JORNADA", "REMESA":"REMESA", "VALOR":"VALOR", "TARIFA":"VALOR",
+        "OBSERVACIONES":"OBSERVACIONES", "QUIEN SOLICITA":"QUIEN SOLICITA"
+    }
+    for src, dst in mapping.items():
+        if src in out.columns and dst not in out.columns:
+            out[dst] = out[src]
 
-@st.cache_data(show_spinner=False)
-def read_workbook(file) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, str]]:
-    """Lee el libro CEMEX. Recorridos tiene encabezado en fila 5 del Excel, por eso header=4."""
-    xls = pd.ExcelFile(file)
+    base_cols = ["FECHA","HORA","CC","CONDUCTOR","PLACA","ORIGEN","DESTINO","RUTA","USUARIOS","FUNCIONARIO","TURNO","INGRESO","JORNADA","REMESA","VALOR","OBSERVACIONES","QUIEN SOLICITA"]
+    for c in base_cols:
+        if c not in out.columns:
+            out[c] = np.nan
+    out = out[base_cols]
+    out["TIPO_SERVICIO"] = tipo
+    out["FECHA"] = out["FECHA"].apply(to_date)
+    out["VALOR"] = out["VALOR"].apply(to_number)
+    out["REMESA"] = out["REMESA"].apply(normalize_text)
+    out["PLACA"] = out["PLACA"].apply(normalize_text)
+    out["CONDUCTOR"] = out["CONDUCTOR"].apply(normalize_text)
+    out["CC"] = out["CC"].apply(lambda x: "" if pd.isna(x) else re.sub(r"\.0$", "", str(x).strip()))
+    for c in ["ORIGEN","DESTINO","RUTA","JORNADA","TURNO","OBSERVACIONES","QUIEN SOLICITA","FUNCIONARIO"]:
+        out[c] = out[c].apply(normalize_text)
+    out["DIA"] = out["FECHA"].dt.date
+    out["DIA_SEMANA"] = out["FECHA"].dt.day_name(locale=None)
+    out["MES"] = out["FECHA"].dt.to_period("M").astype(str)
+    out["TIENE_REMESA"] = out["REMESA"].str.len() > 0
+    out["TIENE_PLACA"] = out["PLACA"].str.len() > 0
+    out["TIENE_CONDUCTOR"] = out["CONDUCTOR"].str.len() > 0
+    out["TIENE_CC"] = out["CC"].str.len() > 0
+    out["TIENE_VALOR"] = out["VALOR"] > 0
+    out["FECHA_VALIDA"] = out["FECHA"].notna()
+    return out
+
+@st.cache_data(show_spinner="Leyendo archivo Excel...")
+def read_workbook(file_bytes_or_path):
+    xls = pd.ExcelFile(file_bytes_or_path, engine="openpyxl")
     sheets = xls.sheet_names
+    rec = pd.DataFrame(); adi = pd.DataFrame(); resumen = pd.DataFrame(); turnos = pd.DataFrame()
+    for sh in sheets:
+        nsh = clean_col(sh)
+        if "RECORR" in nsh:
+            rec = read_sheet_flexible(file_bytes_or_path, sh, ["FECHA", "CONDUCTOR", "PLACA", "REMESA", "VALOR"])
+        elif "ADIC" in nsh:
+            adi = read_sheet_flexible(file_bytes_or_path, sh, ["FECHA", "CONDUCTOR", "PLACA", "REMESA", "TARIFA"])
+        elif "RESUM" in nsh:
+            resumen = read_sheet_flexible(file_bytes_or_path, sh, ["CIUDAD", "PLANTA", "RUTA", "TARIFA"])
+        elif "TURNO" in nsh:
+            turnos = read_sheet_flexible(file_bytes_or_path, sh, ["RUTA", "TURNO", "JORNADA"])
+    return rec, adi, resumen, turnos, sheets
 
-    rec = pd.read_excel(file, sheet_name="Recorridos", header=4) if "Recorridos" in sheets else pd.DataFrame()
-    adi = pd.read_excel(file, sheet_name="Adicionales") if "Adicionales" in sheets else pd.DataFrame()
-    res = pd.read_excel(file, sheet_name="Resumen", header=1) if "Resumen" in sheets else pd.DataFrame()
-    turnos = pd.read_excel(file, sheet_name="TURNOS") if "TURNOS" in sheets else pd.DataFrame()
+def bar_chart(df, x, y, title, top=15, horizontal=True):
+    data = df.copy().head(top)
+    if data.empty:
+        st.info("Sin datos para graficar.")
+        return
+    fig, ax = plt.subplots(figsize=(9, max(3, len(data)*0.35) if horizontal else 4))
+    if horizontal:
+        data = data.sort_values(y, ascending=True)
+        ax.barh(data[x].astype(str), data[y])
+        ax.set_xlabel(y)
+    else:
+        ax.bar(data[x].astype(str), data[y])
+        ax.tick_params(axis='x', rotation=45)
+    ax.set_title(title)
+    ax.grid(axis="x" if horizontal else "y", alpha=.25)
+    st.pyplot(fig, clear_figure=True)
 
-    fuente = {"hojas": ", ".join(sheets)}
-    return rec, adi, res, turnos, fuente
+def kpi(label, value, sub=""):
+    st.markdown(f"""
+    <div class='card'>
+      <div class='kpi-title'>{label}</div>
+      <div class='kpi-value'>{value}</div>
+      <div class='kpi-sub'>{sub}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
+def make_excel_download(df_dict):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        for name, df in df_dict.items():
+            safe = name[:31]
+            df.to_excel(writer, sheet_name=safe, index=False)
+    output.seek(0)
+    return output
 
-def prepare_operacion(rec: pd.DataFrame, adi: pd.DataFrame) -> pd.DataFrame:
-    frames = []
+# =========================
+# CARGA ARCHIVO
+# =========================
+st.title("📊 CEMEX Cúcuta | Informe de Legalizaciones")
+st.caption("Dashboard ejecutivo para control de remesas, soportes, pendientes, duplicados y cierre operativo.")
 
-    if not rec.empty:
-        df = rec.copy()
-        df.columns = [clean_col(c) for c in df.columns]
-        if "#" in df.columns:
-            df = df[pd.to_numeric(df["#"], errors="coerce").notna()].copy()
-        df["TIPO_SERVICIO"] = "RECORRIDO PROGRAMADO"
-        if "VALOR" in df.columns:
-            df["VALOR_SERVICIO"] = to_num(df["VALOR"])
-        else:
-            df["VALOR_SERVICIO"] = 0
-        frames.append(df)
+with st.sidebar:
+    st.header("📁 Archivo")
+    uploaded = st.file_uploader("Carga el Excel consolidado CEMEX", type=["xlsx"])
+    local_files = sorted([str(p) for p in Path(".").glob("*.xlsx")])
+    default_name = "CONSOLIDADO CUCUTA JUNIO 2026_V23.xlsx"
+    st.caption("Si estás en Streamlit Cloud, sube el archivo desde este botón. Así evitamos el error FileNotFoundError.")
 
-    if not adi.empty:
-        df = adi.copy()
-        df.columns = [clean_col(c) for c in df.columns]
-        if "#" in df.columns:
-            df = df[pd.to_numeric(df["#"], errors="coerce").notna()].copy()
-        df = df[df.get("FECHA", pd.Series(index=df.index)).notna()].copy()
-        df["TIPO_SERVICIO"] = "ADICIONAL / URBANO"
-        if "TARIFA" in df.columns:
-            df["VALOR_SERVICIO"] = to_num(df["TARIFA"])
-        else:
-            df["VALOR_SERVICIO"] = 0
-        if "HORA" not in df.columns:
-            df["HORA"] = ""
-        if "RUTA" not in df.columns:
-            df["RUTA"] = "ADICIONAL / URBANO"
-        if "CANTIDAD USUARIO" not in df.columns:
-            df["CANTIDAD USUARIO"] = np.nan
-        frames.append(df)
-
-    if not frames:
-        return pd.DataFrame()
-
-    all_cols = sorted(set().union(*[set(f.columns) for f in frames]))
-    base = pd.concat([f.reindex(columns=all_cols) for f in frames], ignore_index=True)
-
-    for c in ["FECHA", "REMESA", "PLACA", "CONDUCTOR", "CC", "ORIGEN", "DESTINO", "RUTA", "JORNADA", "TURNO", "INGRESO", "OBSERVACIONES", "QUIEN SOLICITA"]:
-        if c not in base.columns:
-            base[c] = ""
-
-    base["FECHA"] = pd.to_datetime(base["FECHA"], errors="coerce", dayfirst=True)
-    base["DIA"] = base["FECHA"].dt.day
-    base["DIA_SEMANA"] = base["FECHA"].dt.day_name(locale="es_ES") if hasattr(base["FECHA"].dt, "day_name") else base["FECHA"].dt.day_name()
-    base["SEMANA"] = base["FECHA"].dt.isocalendar().week.astype("Int64")
-    base["MES"] = base["FECHA"].dt.strftime("%Y-%m")
-    base["REMESA_TXT"] = normalize_text(base["REMESA"])
-    base["PLACA_TXT"] = normalize_text(base["PLACA"])
-    base["CONDUCTOR_TXT"] = normalize_text(base["CONDUCTOR"])
-    base["CC_TXT"] = normalize_text(base["CC"])
-    base["VALOR_SERVICIO"] = pd.to_numeric(base["VALOR_SERVICIO"], errors="coerce").fillna(0)
-
-    obligatorios = ["FECHA", "REMESA_TXT", "PLACA_TXT", "CONDUCTOR_TXT", "CC_TXT", "VALOR_SERVICIO"]
-    base["FALTA_FECHA"] = base["FECHA"].isna()
-    base["FALTA_REMESA"] = base["REMESA_TXT"].eq("")
-    base["FALTA_PLACA"] = base["PLACA_TXT"].eq("")
-    base["FALTA_CONDUCTOR"] = base["CONDUCTOR_TXT"].eq("")
-    base["FALTA_CC"] = base["CC_TXT"].eq("")
-    base["FALTA_VALOR"] = base["VALOR_SERVICIO"].le(0)
-    base["CAMPOS_FALTANTES"] = base[["FALTA_FECHA", "FALTA_REMESA", "FALTA_PLACA", "FALTA_CONDUCTOR", "FALTA_CC", "FALTA_VALOR"]].sum(axis=1)
-    base["ESTADO_LEGALIZACION"] = np.where(base["CAMPOS_FALTANTES"].eq(0), "LEGALIZADO", "PENDIENTE / REVISAR")
-    base["REMESA_DUPLICADA"] = base["REMESA_TXT"].ne("") & base.duplicated("REMESA_TXT", keep=False)
-    return base
-
-
-def agg_count_value(df: pd.DataFrame, group: list[str]) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    return (
-        df.groupby(group, dropna=False)
-        .agg(SERVICIOS=("TIPO_SERVICIO", "size"), VALOR=("VALOR_SERVICIO", "sum"), USUARIOS=("CANTIDAD USUARIO", "sum"))
-        .reset_index()
-        .sort_values("SERVICIOS", ascending=False)
-    )
-
-
-# -----------------------------
-# CARGA
-# -----------------------------
-st.title("📋 Informe de Legalizaciones | Cliente CEMEX")
-st.caption("Análisis operativo, documental y de legalización para servicios programados, urbanos y adicionales.")
-
-uploaded = st.sidebar.file_uploader("Cargar archivo Excel CEMEX", type=["xlsx", "xls"])
-file_source = uploaded if uploaded is not None else DEFAULT_FILE
+if uploaded is not None:
+    file_source = BytesIO(uploaded.getvalue())
+    source_name = uploaded.name
+elif os.path.exists(default_name):
+    file_source = default_name
+    source_name = default_name
+elif local_files:
+    file_source = local_files[0]
+    source_name = local_files[0]
+else:
+    st.error("No encontré el archivo Excel. Súbelo con el botón lateral o carga el archivo al repositorio GitHub.")
+    st.stop()
 
 try:
-    rec_raw, adi_raw, resumen_raw, turnos_raw, fuente = read_workbook(file_source)
+    rec_raw, adi_raw, resumen_raw, turnos_raw, sheets = read_workbook(file_source)
 except Exception as e:
-    st.error("No pude leer el archivo. Verifica que esté en la misma carpeta del app o vuelve a cargarlo desde el panel lateral.")
+    st.error("No pude leer el archivo. Verifica que sea .xlsx y que requirements.txt tenga openpyxl.")
     st.exception(e)
     st.stop()
 
-base = prepare_operacion(rec_raw, adi_raw)
-if base.empty:
-    st.warning("No se encontraron datos en las hojas Recorridos o Adicionales.")
+rec = standardize(rec_raw, "PROGRAMADO")
+adi = standardize(adi_raw, "ADICIONAL")
+df = pd.concat([rec, adi], ignore_index=True)
+df = df.dropna(how="all")
+
+if df.empty:
+    st.error("El archivo se leyó, pero no encontré datos en Recorridos o Adicionales.")
     st.stop()
 
-# -----------------------------
+# =========================
 # FILTROS
-# -----------------------------
-st.sidebar.header("Filtros")
-min_date, max_date = base["FECHA"].min(), base["FECHA"].max()
-if pd.notna(min_date) and pd.notna(max_date):
-    rango = st.sidebar.date_input("Rango de fechas", value=(min_date.date(), max_date.date()))
-else:
-    rango = None
+# =========================
+with st.sidebar:
+    st.success(f"Archivo activo: {source_name}")
+    st.write("Hojas detectadas:", ", ".join(sheets))
+    tipos = st.multiselect("Tipo de servicio", sorted(df["TIPO_SERVICIO"].dropna().unique()), default=sorted(df["TIPO_SERVICIO"].dropna().unique()))
+    jornadas = st.multiselect("Jornada", sorted([x for x in df["JORNADA"].dropna().unique() if x]), default=sorted([x for x in df["JORNADA"].dropna().unique() if x]))
+    placas = st.multiselect("Placa", sorted([x for x in df["PLACA"].dropna().unique() if x])[:300])
+    conductores = st.multiselect("Conductor", sorted([x for x in df["CONDUCTOR"].dropna().unique() if x])[:300])
+    fecha_min = df["FECHA"].min()
+    fecha_max = df["FECHA"].max()
+    if pd.notna(fecha_min) and pd.notna(fecha_max):
+        rango = st.date_input("Rango de fechas", value=(fecha_min.date(), fecha_max.date()))
+    else:
+        rango = None
 
-tipos = st.sidebar.multiselect("Tipo de servicio", sorted(base["TIPO_SERVICIO"].dropna().unique()), default=sorted(base["TIPO_SERVICIO"].dropna().unique()))
-jornadas = st.sidebar.multiselect("Jornada", sorted([x for x in base["JORNADA"].dropna().unique() if str(x).strip() != ""]), default=sorted([x for x in base["JORNADA"].dropna().unique() if str(x).strip() != ""]))
-estados = st.sidebar.multiselect("Estado legalización", sorted(base["ESTADO_LEGALIZACION"].unique()), default=sorted(base["ESTADO_LEGALIZACION"].unique()))
-
-f = base.copy()
-if rango and isinstance(rango, tuple) and len(rango) == 2:
-    f = f[(f["FECHA"].dt.date >= rango[0]) & (f["FECHA"].dt.date <= rango[1])]
+f = df.copy()
 if tipos:
     f = f[f["TIPO_SERVICIO"].isin(tipos)]
 if jornadas:
-    f = f[(f["JORNADA"].isin(jornadas)) | (f["JORNADA"].astype(str).str.strip().eq(""))]
-if estados:
-    f = f[f["ESTADO_LEGALIZACION"].isin(estados)]
+    f = f[f["JORNADA"].isin(jornadas)]
+if placas:
+    f = f[f["PLACA"].isin(placas)]
+if conductores:
+    f = f[f["CONDUCTOR"].isin(conductores)]
+if rango and isinstance(rango, tuple) and len(rango) == 2:
+    ini, fin = pd.to_datetime(rango[0]), pd.to_datetime(rango[1])
+    f = f[(f["FECHA"].isna()) | ((f["FECHA"] >= ini) & (f["FECHA"] <= fin))]
 
-# -----------------------------
-# KPIS PRINCIPALES
-# -----------------------------
-total_serv = len(f)
-valor_total = f["VALOR_SERVICIO"].sum()
-legalizados = int((f["ESTADO_LEGALIZACION"] == "LEGALIZADO").sum())
-pendientes = int((f["ESTADO_LEGALIZACION"] != "LEGALIZADO").sum())
-porc_legal = legalizados / total_serv if total_serv else 0
-remesas_unicas = f.loc[f["REMESA_TXT"].ne(""), "REMESA_TXT"].nunique()
-dias_operados = f["FECHA"].dt.date.nunique()
-adicionales = int((f["TIPO_SERVICIO"] == "ADICIONAL / URBANO").sum())
-programados = int((f["TIPO_SERVICIO"] == "RECORRIDO PROGRAMADO").sum())
+# =========================
+# KPIS
+# =========================
+servicios = len(f)
+programados = int((f["TIPO_SERVICIO"] == "PROGRAMADO").sum())
+adicionales = int((f["TIPO_SERVICIO"] == "ADICIONAL").sum())
+valor_total = f["VALOR"].sum()
+remesas_ok = int(f["TIENE_REMESA"].sum())
+remesas_pend = int((~f["TIENE_REMESA"]).sum())
+legalizacion = remesas_ok / servicios if servicios else 0
+valor_pendiente = f.loc[~f["TIENE_REMESA"], "VALOR"].sum()
+valor_legalizado = f.loc[f["TIENE_REMESA"], "VALOR"].sum()
+duplicadas = int(f[f["REMESA"].ne("")].duplicated("REMESA", keep=False).sum())
+fechas_malas = int((~f["FECHA_VALIDA"]).sum())
+placas_pend = int((~f["TIENE_PLACA"]).sum())
+conduct_pend = int((~f["TIENE_CONDUCTOR"]).sum())
+cc_pend = int((~f["TIENE_CC"]).sum())
+valor_pend = int((~f["TIENE_VALOR"]).sum())
 
-st.subheader("1. Tarjetas de conteo ejecutivo")
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1: kpi_card("Servicios totales", f"{total_serv:,.0f}".replace(",", "."), f"Programados: {programados} | Adic.: {adicionales}")
-with c2: kpi_card("Valor legalizable", money(valor_total), "Suma de VALOR/TARIFA")
-with c3: kpi_card("% legalizado", pct(porc_legal), f"{legalizados} servicios completos")
-with c4: kpi_card("Pendientes/revisar", f"{pendientes:,.0f}".replace(",", "."), "Falta remesa, fecha, placa, conductor, CC o valor")
-with c5: kpi_card("Remesas únicas", f"{remesas_unicas:,.0f}".replace(",", "."), f"Días operados: {dias_operados}")
+st.subheader("1) Tarjetas ejecutivas de legalización")
+cols = st.columns(5)
+with cols[0]: kpi("Servicios totales", f"{servicios:,}".replace(",","."), "Programados + adicionales")
+with cols[1]: kpi("Programados", f"{programados:,}".replace(",","."), pct(programados/servicios if servicios else 0))
+with cols[2]: kpi("Adicionales", f"{adicionales:,}".replace(",","."), pct(adicionales/servicios if servicios else 0))
+with cols[3]: kpi("Valor legalizable", money(valor_total), "Base filtrada")
+with cols[4]: kpi("% legalización", pct(legalizacion), f"{remesas_ok} con remesa")
 
-c6, c7, c8, c9, c10 = st.columns(5)
-with c6: kpi_card("Sin remesa", f"{int(f['FALTA_REMESA'].sum()):,.0f}".replace(",", "."), "Crítico para legalización")
-with c7: kpi_card("Remesa duplicada", f"{int(f['REMESA_DUPLICADA'].sum()):,.0f}".replace(",", "."), "Revisar posibles cruces")
-with c8: kpi_card("Sin placa", f"{int(f['FALTA_PLACA'].sum()):,.0f}".replace(",", "."), "Validación documental")
-with c9: kpi_card("Sin conductor/CC", f"{int((f['FALTA_CONDUCTOR'] | f['FALTA_CC']).sum()):,.0f}".replace(",", "."), "Validación conductor")
-with c10: kpi_card("Sin valor", f"{int(f['FALTA_VALOR'].sum()):,.0f}".replace(",", "."), "No legalizable financieramente")
+cols = st.columns(5)
+with cols[0]: kpi("Valor legalizado", money(valor_legalizado), "Con remesa")
+with cols[1]: kpi("Valor pendiente", money(valor_pendiente), "Sin remesa")
+with cols[2]: kpi("Remesas pendientes", f"{remesas_pend:,}".replace(",","."), "Cierre requerido")
+with cols[3]: kpi("Remesas duplicadas", f"{duplicadas:,}".replace(",","."), "Revisar antes de facturar")
+with cols[4]: kpi("Fechas inválidas", f"{fechas_malas:,}".replace(",","."), "Calidad de base")
 
-# -----------------------------
-# ALERTA ANALÍTICA
-# -----------------------------
-st.subheader("2. Diagnóstico de legalizaciones")
-if pendientes == 0 and int(f["REMESA_DUPLICADA"].sum()) == 0:
-    st.markdown("<span class='alert-ok'>✅ La base filtrada está completa para legalización: no presenta faltantes críticos ni remesas duplicadas.</span>", unsafe_allow_html=True)
+# =========================
+# SEMÁFORO ANALISTA
+# =========================
+st.subheader("2) Diagnóstico de cierre")
+if legalizacion >= 0.95 and remesas_pend == 0 and duplicadas == 0:
+    st.markdown("<div class='ok'><b>Estado:</b> Cierre sano. La base está lista para validación final y facturación.</div>", unsafe_allow_html=True)
+elif legalizacion >= 0.85:
+    st.markdown("<div class='alerta'><b>Estado:</b> Cierre en riesgo medio. Priorizar remesas pendientes y duplicadas.</div>", unsafe_allow_html=True)
 else:
-    st.markdown(
-        f"<span class='alert-warn'>⚠️ Se deben revisar {pendientes} servicios con campos incompletos y {int(f['REMESA_DUPLICADA'].sum())} registros con remesa duplicada.</span>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("<div class='bad'><b>Estado:</b> Cierre crítico. El porcentaje de legalización es bajo y requiere gestión inmediata.</div>", unsafe_allow_html=True)
 
-faltantes = pd.DataFrame({
-    "Campo crítico": ["Fecha", "Remesa", "Placa", "Conductor", "CC", "Valor/Tarifa"],
-    "Registros con novedad": [int(f["FALTA_FECHA"].sum()), int(f["FALTA_REMESA"].sum()), int(f["FALTA_PLACA"].sum()), int(f["FALTA_CONDUCTOR"].sum()), int(f["FALTA_CC"].sum()), int(f["FALTA_VALOR"].sum())],
-})
-left, right = st.columns([1, 2])
-with left:
-    st.dataframe(faltantes, use_container_width=True, hide_index=True)
-with right:
-    st.caption("Campos pendientes para legalización")
-    chart_data = faltantes.set_index("Campo crítico")["Registros con novedad"]
-    st.bar_chart(chart_data, height=360)
+c1, c2, c3, c4 = st.columns(4)
+with c1: kpi("Placas pendientes", f"{placas_pend:,}".replace(",","."), "Control documental")
+with c2: kpi("Conductores pendientes", f"{conduct_pend:,}".replace(",","."), "Responsable del soporte")
+with c3: kpi("CC pendientes", f"{cc_pend:,}".replace(",","."), "Identificación conductor")
+with c4: kpi("Valores pendientes", f"{valor_pend:,}".replace(",","."), "Tarifa no registrada")
 
-# -----------------------------
-# VISUALES OPERATIVOS
-# -----------------------------
-st.subheader("3. Distribución operativa y financiera")
-tab1, tab2, tab3, tab4 = st.tabs(["Por fecha", "Por ruta/jornada", "Por conductor/placa", "Adicionales"])
+# =========================
+# ANÁLISIS
+# =========================
+st.subheader("3) Análisis operativo y financiero")
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📅 Diario", "🚗 Placas", "👤 Conductores", "🧾 Remesas", "⚠️ Calidad"])
 
 with tab1:
-    diario = agg_count_value(f, ["FECHA", "TIPO_SERVICIO"])
-    if not diario.empty:
-        diario["FECHA_TXT"] = diario["FECHA"].dt.strftime("%d/%m/%Y")
-        st.caption("Servicios por día")
-        chart_diario = diario.pivot_table(index="FECHA_TXT", columns="TIPO_SERVICIO", values="SERVICIOS", aggfunc="sum", fill_value=0)
-        st.bar_chart(chart_diario, height=420)
-        diario_valor = f.groupby("FECHA", dropna=False).agg(SERVICIOS=("TIPO_SERVICIO", "size"), VALOR=("VALOR_SERVICIO", "sum"), REMESAS=("REMESA_TXT", "nunique")).reset_index()
-        diario_valor["FECHA"] = diario_valor["FECHA"].dt.strftime("%d/%m/%Y")
-        diario_valor["VALOR"] = diario_valor["VALOR"].map(money)
-        st.dataframe(diario_valor, use_container_width=True, hide_index=True)
+    diario = f.groupby("DIA", dropna=False).agg(
+        SERVICIOS=("TIPO_SERVICIO", "size"),
+        VALOR=("VALOR", "sum"),
+        CON_REMESA=("TIENE_REMESA", "sum")
+    ).reset_index()
+    diario["% LEGALIZACION"] = diario["CON_REMESA"] / diario["SERVICIOS"]
+    st.dataframe(diario, use_container_width=True)
+    chart = diario.dropna(subset=["DIA"]).copy()
+    chart["DIA"] = chart["DIA"].astype(str)
+    bar_chart(chart.sort_values("DIA"), "DIA", "SERVICIOS", "Servicios por día", top=40, horizontal=False)
 
 with tab2:
-    col_a, col_b = st.columns(2)
-    rutas = agg_count_value(f, ["RUTA"])
-    jornadas_df = agg_count_value(f, ["JORNADA"])
-    with col_a:
-        st.caption("Top rutas por cantidad de servicios")
-        st.bar_chart(rutas.head(15).set_index("RUTA")["SERVICIOS"], height=420)
-    with col_b:
-        st.caption("Participación por jornada")
-        st.bar_chart(jornadas_df.set_index("JORNADA")["SERVICIOS"], height=420)
-    rutas_show = rutas.copy()
-    rutas_show["VALOR"] = rutas_show["VALOR"].map(money)
-    st.dataframe(rutas_show, use_container_width=True, hide_index=True)
+    placas_df = f.groupby("PLACA").agg(SERVICIOS=("PLACA","size"), VALOR=("VALOR","sum"), REMESAS_OK=("TIENE_REMESA","sum")).reset_index()
+    placas_df = placas_df[placas_df["PLACA"] != ""].sort_values("SERVICIOS", ascending=False)
+    placas_df["% LEGALIZACION"] = placas_df["REMESAS_OK"] / placas_df["SERVICIOS"]
+    st.dataframe(placas_df, use_container_width=True)
+    bar_chart(placas_df, "PLACA", "SERVICIOS", "Top placas por cantidad de servicios")
 
 with tab3:
-    col_a, col_b = st.columns(2)
-    conductores = agg_count_value(f[f["CONDUCTOR_TXT"].ne("")], ["CONDUCTOR"])
-    placas = agg_count_value(f[f["PLACA_TXT"].ne("")], ["PLACA"])
-    with col_a:
-        st.caption("Servicios por conductor")
-        st.bar_chart(conductores.head(12).set_index("CONDUCTOR")["SERVICIOS"], height=450)
-    with col_b:
-        st.caption("Servicios por placa")
-        st.bar_chart(placas.head(12).set_index("PLACA")["SERVICIOS"], height=450)
+    cond_df = f.groupby("CONDUCTOR").agg(SERVICIOS=("CONDUCTOR","size"), VALOR=("VALOR","sum"), REMESAS_OK=("TIENE_REMESA","sum")).reset_index()
+    cond_df = cond_df[cond_df["CONDUCTOR"] != ""].sort_values("SERVICIOS", ascending=False)
+    cond_df["% LEGALIZACION"] = cond_df["REMESAS_OK"] / cond_df["SERVICIOS"]
+    st.dataframe(cond_df, use_container_width=True)
+    bar_chart(cond_df, "CONDUCTOR", "SERVICIOS", "Top conductores por cantidad de servicios")
 
 with tab4:
-    adi_f = f[f["TIPO_SERVICIO"] == "ADICIONAL / URBANO"].copy()
-    if adi_f.empty:
-        st.info("No hay adicionales en el filtro seleccionado.")
-    else:
-        solicitantes = agg_count_value(adi_f, ["QUIEN SOLICITA"])
-        solicitantes_show = solicitantes.copy()
-        solicitantes_show["VALOR"] = solicitantes_show["VALOR"].map(money)
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.caption("Adicionales por solicitante")
-            st.bar_chart(solicitantes.set_index("QUIEN SOLICITA")["SERVICIOS"], height=420)
-        with col_b:
-            obs = agg_count_value(adi_f, ["OBSERVACIONES"])
-            st.caption("Adicionales por observación/tipo")
-            st.bar_chart(obs.head(10).set_index("OBSERVACIONES")["SERVICIOS"], height=420)
-        st.dataframe(solicitantes_show, use_container_width=True, hide_index=True)
+    dup = f[(f["REMESA"] != "") & (f.duplicated("REMESA", keep=False))].sort_values("REMESA")
+    pendientes = f[~f["TIENE_REMESA"]].copy()
+    st.markdown("**Remesas duplicadas**")
+    st.dataframe(dup, use_container_width=True)
+    st.markdown("**Servicios pendientes de remesa**")
+    st.dataframe(pendientes, use_container_width=True)
 
-# -----------------------------
-# TABLA DE NOVEDADES PARA GESTIÓN
-# -----------------------------
-st.subheader("4. Matriz de gestión para cierre y legalización")
-cols_show = ["TIPO_SERVICIO", "FECHA", "REMESA", "PLACA", "CONDUCTOR", "CC", "ORIGEN", "DESTINO", "RUTA", "JORNADA", "TURNO", "VALOR_SERVICIO", "ESTADO_LEGALIZACION", "CAMPOS_FALTANTES", "REMESA_DUPLICADA", "OBSERVACIONES", "QUIEN SOLICITA"]
-cols_show = [c for c in cols_show if c in f.columns]
-gestion = f[cols_show].copy()
-if "FECHA" in gestion.columns:
-    gestion["FECHA"] = pd.to_datetime(gestion["FECHA"], errors="coerce").dt.strftime("%d/%m/%Y")
-if "VALOR_SERVICIO" in gestion.columns:
-    gestion["VALOR_SERVICIO"] = gestion["VALOR_SERVICIO"].map(money)
+with tab5:
+    calidad = pd.DataFrame({
+        "ALERTA": ["Sin remesa", "Remesa duplicada", "Sin fecha válida", "Sin placa", "Sin conductor", "Sin CC", "Sin valor"],
+        "CONTEO": [remesas_pend, duplicadas, fechas_malas, placas_pend, conduct_pend, cc_pend, valor_pend]
+    }).sort_values("CONTEO", ascending=False)
+    st.dataframe(calidad, use_container_width=True)
+    bar_chart(calidad, "ALERTA", "CONTEO", "Pareto de alertas de legalización", top=10)
 
-solo_novedades = st.toggle("Ver solo pendientes / duplicados", value=True)
-if solo_novedades:
-    idx = (f["ESTADO_LEGALIZACION"] != "LEGALIZADO") | (f["REMESA_DUPLICADA"])
-    gestion = gestion.loc[idx]
-st.dataframe(gestion, use_container_width=True, hide_index=True)
+# =========================
+# MATRIZ DE GESTIÓN
+# =========================
+st.subheader("4) Matriz de gestión para cierre")
+gestion = f.copy()
+gestion["ESTADO_LEGALIZACION"] = np.where(gestion["TIENE_REMESA"], "LEGALIZADO", "PENDIENTE REMESA")
+gestion["ALERTA"] = ""
+gestion.loc[~gestion["TIENE_REMESA"], "ALERTA"] += "SIN REMESA | "
+gestion.loc[gestion["REMESA"].ne("") & gestion.duplicated("REMESA", keep=False), "ALERTA"] += "REMESA DUPLICADA | "
+gestion.loc[~gestion["FECHA_VALIDA"], "ALERTA"] += "FECHA INVALIDA | "
+gestion.loc[~gestion["TIENE_PLACA"], "ALERTA"] += "SIN PLACA | "
+gestion.loc[~gestion["TIENE_CONDUCTOR"], "ALERTA"] += "SIN CONDUCTOR | "
+gestion.loc[~gestion["TIENE_CC"], "ALERTA"] += "SIN CC | "
+gestion.loc[~gestion["TIENE_VALOR"], "ALERTA"] += "SIN VALOR | "
+gestion["ALERTA"] = gestion["ALERTA"].str.rstrip(" | ")
+cols_show = ["ESTADO_LEGALIZACION","ALERTA","TIPO_SERVICIO","FECHA","HORA","REMESA","PLACA","CONDUCTOR","CC","ORIGEN","DESTINO","RUTA","JORNADA","TURNO","VALOR","OBSERVACIONES","QUIEN SOLICITA"]
+st.dataframe(gestion[cols_show], use_container_width=True, height=420)
 
-# Descargar Excel de gestión
-export = f.copy()
-export["FECHA"] = pd.to_datetime(export["FECHA"], errors="coerce").dt.strftime("%d/%m/%Y")
-bytes_out = None
-try:
-    import io
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        export.to_excel(writer, sheet_name="Base_Gestion_Legalizacion", index=False)
-        faltantes.to_excel(writer, sheet_name="Resumen_Faltantes", index=False)
-        agg_count_value(f, ["RUTA"]).to_excel(writer, sheet_name="Resumen_Rutas", index=False)
-        agg_count_value(f, ["CONDUCTOR"]).to_excel(writer, sheet_name="Resumen_Conductores", index=False)
-    bytes_out = buffer.getvalue()
-except Exception:
-    bytes_out = None
+resumen_kpis = pd.DataFrame({
+    "KPI": ["Servicios totales", "Programados", "Adicionales", "Valor legalizable", "Valor legalizado", "Valor pendiente", "% Legalizacion", "Remesas pendientes", "Remesas duplicadas"],
+    "VALOR": [servicios, programados, adicionales, valor_total, valor_legalizado, valor_pendiente, legalizacion, remesas_pend, duplicadas]
+})
+excel = make_excel_download({
+    "KPIS": resumen_kpis,
+    "MATRIZ_GESTION": gestion[cols_show],
+    "DIARIO": diario if 'diario' in locals() else pd.DataFrame(),
+})
+st.download_button("⬇️ Descargar matriz de gestión en Excel", data=excel, file_name="informe_legalizaciones_cemex_cucuta.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-if bytes_out:
-    st.download_button(
-        "⬇️ Descargar matriz de gestión en Excel",
-        data=bytes_out,
-        file_name="matriz_legalizacion_cemex.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-# -----------------------------
-# COMPARATIVO CONTRA HOJA RESUMEN
-# -----------------------------
-st.subheader("5. Validación contra hoja Resumen")
-if not resumen_raw.empty:
-    st.caption("La hoja Resumen del archivo sirve como referencia, pero este dashboard audita directamente Recorridos + Adicionales.")
-    st.dataframe(resumen_raw, use_container_width=True, hide_index=True)
-    st.info(f"Total calculado desde las bases operativas: {total_serv} servicios | {money(valor_total)}")
-else:
-    st.info("No se encontró hoja Resumen para comparar.")
-
-st.caption("Informe diseñado con enfoque de legalizaciones: completitud de remesa, trazabilidad de conductor/placa, valor legalizable, duplicidades y control de adicionales.")
+st.caption("Desarrollado para control de legalizaciones CEMEX: remesa, valor, conductor, placa, fecha, duplicados y cierre operativo.")
